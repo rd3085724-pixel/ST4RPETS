@@ -1,8 +1,3 @@
-// server.js
-// Starpets-like themed private site with safe Roblox verification (no passwords)
-// Run: npm init -y && npm i express node-fetch express-session dotenv body-parser
-// Then: node server.js
-
 require('dotenv').config();
 const express = require('express');
 const fetch = require('node-fetch'); // if using Node 18+ you can use global fetch instead
@@ -19,12 +14,11 @@ app.use(session({
   secret: process.env.SESSION_SECRET || 'dev-secret-change-me',
   resave: false,
   saveUninitialized: true,
-  cookie: { secure: false } // set to true when using HTTPS
+  cookie: { secure: true } // set to true when using HTTPS
 }));
 
 const SITE_INVITE_CODE = process.env.SITE_INVITE_CODE || '745392';
 
-// In-memory stores for demo only
 const verificationTokens = new Map();
 const verifiedUsers = new Set();
 
@@ -176,7 +170,7 @@ app.post('/verify', async (req, res) => {
 app.get('/app', (req, res) => {
   if (!req.session || !req.session.verifiedUser) return res.redirect('/');
   const user = req.session.verifiedUser;
-  // Example pet inventory (mock)
+  // Example pet inventory 
   const pets = [
     { name: 'Starlight', type: 'Dragon', rarity: 'Legendary', img: '/pet1.png' },
     { name: 'Comet', type: 'Fox', rarity: 'Rare', img: '/pet2.png' },
