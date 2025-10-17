@@ -1,0 +1,289 @@
+// server.js
+// Starpets-like themed private site with safe Roblox verification (no passwords)
+// Run: npm init -y && npm i express node-fetch express-session dotenv body-parser
+// Then: node server.js
+
+require('dotenv').config();
+const express = require('express');
+const fetch = require('node-fetch'); // if using Node 18+ you can use global fetch instead
+const session = require('express-session');
+const bodyParser = require('body-parser');
+const crypto = require('crypto');
+const path = require('path');
+
+const app = express();
+app.use(bodyParser.urlencoded({ extended: false }));
+app.use(express.static(path.join(__dirname, 'public')));
+
+app.use(session({
+  secret: process.env.SESSION_SECRET || 'dev-secret-change-me',
+  resave: false,
+  saveUninitialized: true,
+  cookie: { secure: false } // set to true when using HTTPS
+}));
+
+const SITE_INVITE_CODE = process.env.SITE_INVITE_CODE || '745392';
+
+// In-memory stores for demo only
+const verificationTokens = new Map();
+const verifiedUsers = new Set();
+
+// Simple template renderer (keeps everything in one file for simplicity)
+function page(title, innerHtml) {
+  return `<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta name="viewport" content="width=device-width,initial-scale=1"/>
+<title>${title}</title>
+<link rel="stylesheet" href="/styles.css">
+<link href="https://fonts.googleapis.com/css2?family=Baloo+2:wght@400;700&display=swap" rel="stylesheet">
+</head>
+<body>
+  <header class="topbar">
+    <div class="brand">
+      <div class="logo">★</div>
+      <div class="title">StarPets — Private</div>
+    </div>
+    <div class="rightcap">
+      ${innerHtml.includes('LogoutFormPlaceholder') ? '' : ''}
+    </div>
+  </header>
+  <main class="container">
+    ${innerHtml}
+  </main>
+  <footer class="footer">Made private • invite code required • safe verification (no passwords)</footer>
+</body>
+</html>`;
+}
+
+// Routes
+app.get('/', (req, res) => {
+  if (req.session && req.session.verifiedUser) return res.redirect('/app');
+  res.send(page('Enter invite', `
+    <section class="card center">
+      <h2>Private StarPets Access</h2>
+      <p class="muted">Enter the invite code to continue. This site will never ask for your Roblox password.</p>
+      <form method="POST" action="/enter-invite" class="form">
+        <input name="invite" type="password" placeholder="Invite code" required autocomplete="one-time-code" />
+        <button class="btn btn-primary">Enter</button>
+      </form>
+      <p class="small muted">Invite code is required. After that you can verify ownership of your Roblox account without giving a password.</p>
+    </section>
+  `));
+});
+
+app.post('/enter-invite', (req, res) => {
+  const invite = (req.body.invite || '').trim();
+  if (invite === SITE_INVITE_CODE) {
+    req.session.allowed = true;
+    return res.redirect('/start');
+  }
+  res.send(page('Bad invite', `
+    <section class="card center">
+      <h2>Wrong code</h2>
+      <p class="error">That invite code didn't match. Try again.</p>
+      <a class="btn" href="/">Back</a>
+    </section>
+  `));
+});
+
+app.get('/start', (req, res) => {
+  if (!req.session.allowed) return res.redirect('/');
+  if (req.session.verifiedUser) return res.redirect('/app');
+  res.send(page('Verify Roblox', `
+    <section class="card">
+      <h2>Verify your Roblox account</h2>
+      <p class="muted">We verify ownership by asking you to temporarily add a short token to your Roblox profile description (public). No passwords required.</p>
+      <form method="POST" action="/request-token" class="form">
+        <label>Roblox username</label>
+        <input name="username" type="text" placeholder="Exact Roblox username" required />
+        <button class="btn btn-primary">Request token</button>
+      </form>
+      <p class="small muted">After verification you can remove the token from your profile.</p>
+    </section>
+  `));
+});
+
+app.post('/request-token', (req, res) => {
+  if (!req.session.allowed) return res.redirect('/');
+  const username = (req.body.username || '').trim();
+  if (!username) return res.send(page('Error', `<section class="card center"><p class="error">Please provide a username</p><a class="btn" href="/start">Back</a></section>`));
+  const token = crypto.randomBytes(4).toString('hex');
+  verificationTokens.set(token, { username, createdAt: Date.now() });
+  req.session.pendingToken = token;
+  req.session.pendingUsername = username;
+  res.send(page('Place token', `
+    <section class="card">
+      <h2>Place the token in your profile</h2>
+      <p>1. Edit your Roblox profile description and paste this exact token (temporary):</p>
+      <pre class="token">${token}</pre>
+      <p>2. Save your profile, then click <strong>Verify</strong> below. We will check your public profile for the token.</p>
+      <form method="POST" action="/verify" class="form">
+        <button class="btn btn-primary">Verify</button>
+      </form>
+      <p class="muted">If verification succeeds you will be granted access to your private StarPets page.</p>
+    </section>
+  `));
+});
+
+app.post('/verify', async (req, res) => {
+  if (!req.session.allowed) return res.redirect('/');
+  const token = req.session.pendingToken;
+  const username = req.session.pendingUsername;
+  if (!token || !username) return res.send(page('Error', `<section class="card center"><p class="error">No pending verification. Start again.</p><a class="btn" href="/start">Start</a></section>`));
+  try {
+    // Roblox API: get user id by username (public)
+    const uRes = await fetch(`https://api.roblox.com/users/get-by-username?username=${encodeURIComponent(username)}`);
+    if (!uRes.ok) throw new Error('Roblox username lookup failed');
+    const uJson = await uRes.json();
+    if (!uJson || !uJson.Id) {
+      return res.send(page('Not found', `<section class="card center"><p class="error">Roblox username not found: <strong>${username}</strong></p><a class="btn" href="/start">Back</a></section>`));
+    }
+    const userId = uJson.Id;
+    const profileUrl = `https://www.roblox.com/users/${userId}/profile`;
+    const pRes = await fetch(profileUrl, { headers: { 'User-Agent': 'starpets-verifier/1.0' }});
+    const html = await pRes.text();
+    if (html.includes(token)) {
+      verifiedUsers.add(username.toLowerCase());
+      req.session.verifiedUser = username;
+      verificationTokens.delete(token);
+      delete req.session.pendingToken;
+      delete req.session.pendingUsername;
+      return res.send(page('Verified', `
+        <section class="card center">
+          <h2>Verified ✅</h2>
+          <p class="success">Account <strong>${username}</strong> verified. Welcome!</p>
+          <a class="btn btn-primary" href="/app">Enter your StarPets</a>
+        </section>
+      `));
+    } else {
+      return res.send(page('Token not found', `
+        <section class="card">
+          <h2>Token not visible</h2>
+          <p class="error">We couldn't find the token on the public profile page.</p>
+          <p>Profile URL: <a href="${profileUrl}" target="_blank" rel="noopener">${profileUrl}</a></p>
+          <a class="btn" href="/start">Try again</a>
+        </section>
+      `));
+    }
+  } catch (err) {
+    console.error(err);
+    return res.send(page('Error', `<section class="card center"><p class="error">Verification error. Try again later.</p><a class="btn" href="/start">Back</a></section>`));
+  }
+});
+
+app.get('/app', (req, res) => {
+  if (!req.session || !req.session.verifiedUser) return res.redirect('/');
+  const user = req.session.verifiedUser;
+  // Example pet inventory (mock)
+  const pets = [
+    { name: 'Starlight', type: 'Dragon', rarity: 'Legendary', img: '/pet1.png' },
+    { name: 'Comet', type: 'Fox', rarity: 'Rare', img: '/pet2.png' },
+    { name: 'Neb', type: 'Cat', rarity: 'Common', img: '/pet3.png' },
+  ];
+  const petHtml = pets.map(p => `
+    <div class="pet-card">
+      <img src="${p.img}" alt="${p.name}" class="pet-img"/>
+      <div class="pet-info">
+        <div class="pet-name">${p.name}</div>
+        <div class="pet-meta">${p.type} • <span class="rarity ${p.rarity.toLowerCase()}">${p.rarity}</span></div>
+      </div>
+    </div>
+  `).join('');
+  res.send(page(`${user}'s StarPets`, `
+    <section class="card">
+      <div class="app-header">
+        <div>
+          <h2>Welcome, ${user}</h2>
+          <p class="muted">Your private pet inventory</p>
+        </div>
+        <form method="POST" action="/logout" class="LogoutFormPlaceholder">
+          <button class="btn">Log out</button>
+        </form>
+      </div>
+
+      <div class="inventory-grid">
+        ${petHtml}
+      </div>
+
+      <section class="card small">
+        <h3>Site controls</h3>
+        <p class="muted">This section is where you'd add admin actions to grant items, change cosmetics, etc. For demo, these are mock actions.</p>
+        <form class="form" onsubmit="alert('Demo action — implement server side')">
+          <input placeholder="Give item name" />
+          <button class="btn btn-primary" type="button" onclick="alert('Demo — grant item')">Grant Item</button>
+        </form>
+      </section>
+    </section>
+  `));
+});
+
+app.post('/logout', (req, res) => {
+  req.session.destroy(()=>res.redirect('/'));
+});
+
+// serve small built-in static assets (img + css) from memory by writing files to /public
+// Ensure /public exists with the following files: styles.css, pet1.png, pet2.png, pet3.png.
+// To keep this example simple, we will create minimal files if they don't exist.
+const fs = require('fs');
+const publicDir = path.join(__dirname, 'public');
+if (!fs.existsSync(publicDir)) fs.mkdirSync(publicDir);
+
+const cssPath = path.join(publicDir, 'styles.css');
+if (!fs.existsSync(cssPath)) {
+  fs.writeFileSync(cssPath, `
+:root{
+  --bg:#0b1020; --card:#0f1724; --accent:#ffd166; --muted:#9aa8c3; --glass: rgba(255,255,255,0.03);
+  --accent-2:#7ee7f7;
+  font-family: 'Baloo 2', system-ui, -apple-system, 'Segoe UI', Roboto, 'Helvetica Neue', Arial;
+}
+*{box-sizing:border-box}
+body{margin:0;background:linear-gradient(180deg,#06101a 0%, #071a2a 100%);color:#eaf2ff;min-height:100vh}
+.topbar{display:flex;align-items:center;justify-content:space-between;padding:16px 24px;background:linear-gradient(90deg,rgba(255,255,255,0.02),transparent);border-bottom:1px solid rgba(255,255,255,0.03)}
+.brand{display:flex;align-items:center;gap:12px}
+.logo{width:48px;height:48px;border-radius:10px;background:linear-gradient(135deg,var(--accent),#ff8fab);display:flex;align-items:center;justify-content:center;font-weight:700;color:#081124;font-size:22px;box-shadow:0 6px 18px rgba(255,209,102,0.08)}
+.title{font-size:20px;font-weight:700}
+.container{max-width:1000px;margin:28px auto;padding:0 16px}
+.card{background:var(--card);border-radius:12px;padding:18px;margin-bottom:18px;box-shadow:0 8px 30px rgba(2,6,23,0.6);border:1px solid rgba(255,255,255,0.03)}
+.center{text-align:center}
+.form{display:flex;flex-direction:column;gap:10px;max-width:420px}
+.form input[type=text], .form input[type=password], .form input{padding:10px;border-radius:8px;border:1px solid rgba(255,255,255,0.05);background:var(--glass);color:inherit}
+.btn{padding:10px 14px;border-radius:10px;background:transparent;border:1px solid rgba(255,255,255,0.06);color:inherit;cursor:pointer}
+.btn-primary{background:linear-gradient(90deg,var(--accent),var(--accent-2));color:#081124;border:none;box-shadow:0 8px 30px rgba(126,231,247,0.06)}
+.small{font-size:0.9rem}
+.muted{color:var(--muted)}
+.error{color:#ff9999}
+.success{color:#b6ffb3}
+.token{background:#071826;padding:8px;border-radius:8px;border:1px dashed rgba(255,255,255,0.03);display:inline-block}
+.app-header{display:flex;justify-content:space-between;align-items:center}
+.inventory-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(200px,1fr));gap:14px;margin-top:12px}
+.pet-card{background:linear-gradient(180deg, rgba(255,255,255,0.02), transparent);padding:12px;border-radius:12px;display:flex;gap:12px;align-items:center;border:1px solid rgba(255,255,255,0.03)}
+.pet-img{width:88px;height:88px;border-radius:10px;background:linear-gradient(135deg,#ffd166,#ff8fab);object-fit:cover}
+.pet-info{flex:1}
+.pet-name{font-weight:700;font-size:1.05rem}
+.pet-meta{color:var(--muted);font-size:0.9rem;margin-top:6px}
+.rarity.common{color:#cbd5e1}
+.rarity.rare{color:#7ee7f7}
+.rarity.legendary{color:#ffd166}
+.footer{text-align:center;color:var(--muted);padding:24px 0;font-size:0.9rem}
+@media (max-width:600px){.brand .title{font-size:16px}}
+  `);
+}
+
+const img1 = path.join(publicDir, 'pet1.png');
+const img2 = path.join(publicDir, 'pet2.png');
+const img3 = path.join(publicDir, 'pet3.png');
+if (!fs.existsSync(img1)) {
+  // generate small placeholder PNGs as colored squares (very small base64)
+  const placeholder = Buffer.from(
+    'iVBORw0KGgoAAAANSUhEUgAAAEAAAAAQCAYAAAB49l5XAAAACXBIWXMAAAsTAAALEwEAmpwYAAAAGXRFWHRTb2Z0d2FyZQBBZG9iZSBJ' +
+    'bWFnZVJlYWR5ccllPAAAAK5JREFUeNpi/P//PwMlgImBQjDwH4n4GJgYGBgYGBkYGRgYGBgYGBg4P8f8GhgYGBh4x8D8QwMDw/x8YGBg' +
+    'YGJiYg4GBgYGRgYGBg4P8f8GhgYGBh4x8D8QwMDw/x8YGBgYGBiYGABBgAAMwQq5nBx3VwAAAAASUVORK5CYII=', 'base64');
+  fs.writeFileSync(img1, placeholder);
+}
+if (!fs.existsSync(img2)) fs.copyFileSync(img1, img2);
+if (!fs.existsSync(img3)) fs.copyFileSync(img1, img3);
+
+const port = process.env.PORT || 3000;
+app.listen(port, ()=>console.log(`StarPets-like private server running on http://localhost:${port} (invite code: ${SITE_INVITE_CODE})`));
